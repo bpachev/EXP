@@ -313,6 +313,181 @@ __global__ void coordKernel
   }
 }
 
+#define MAX_RADIAL_COEFFS 64
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
+#else
+__device__ double atomicAdd(double* address, double val)
+{
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#endif
+
+__global__ void combinedCoefKernel
+(dArray<cuFP_t> out_coef, dArray<cuFP_t> tvar, dArray<cuFP_t> work,
+ dArray<cuFP_t> used, dArray<cudaTextureObject_t> tex,
+ dArray<cuFP_t> Mass, dArray<cuFP_t> Afac, dArray<cuFP_t> Phi,
+ dArray<cuFP_t> Plm,  dArray<int> Indx,  int stride, 
+ int l, int m, unsigned Lmax, unsigned int nmax, cuFP_t norm,
+ PII lohi, bool compute)
+{
+  extern __shared__ cuFP_t shared_coeff_sums[];
+  const int tid   = blockDim.x * blockIdx.x + threadIdx.x;
+  const int psiz  = (Lmax+1)*(Lmax+2)/2;
+  const int N     = lohi.second - lohi.first;
+  const int NUM_RADIAL_COEFFS = 2*nmax;
+  const cuFP_t fac0 = -4.0*M_PI;
+  cuFP_t local_coeff_sums[MAX_RADIAL_COEFFS];
+  for (int j = 0; j < NUM_RADIAL_COEFFS; j++) local_coeff_sums[j] = 0.0;
+
+  for (int str=0; str<stride; str++) {
+
+    int i     = tid*stride + str;
+    int npart = i + lohi.first;
+
+    if (npart < lohi.second) {
+
+      cuFP_t mass = Mass._v[i];
+
+#ifdef BOUNDS_CHECK
+      if (i>=Mass._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
+
+      if (mass>0.0) {
+				// For accumulating mass of used particles
+	if (l==0 and m==0) used._v[i] = mass;
+
+#ifdef BOUNDS_CHECK
+	if (i>=Phi._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
+	cuFP_t phi  = Phi._v[i];
+	cuFP_t cosp = cos(phi*m);
+	cuFP_t sinp = sin(phi*m);
+	
+#ifdef BOUNDS_CHECK
+	if (psiz*(i+1)>Plm._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif	
+	cuFP_t *plm = &Plm._v[psiz*i];
+	
+	// Do the interpolation
+	//
+	cuFP_t a = Afac._v[i];
+	cuFP_t b = 1.0 - a;
+	int  ind = Indx._v[i];
+	
+#ifdef BOUNDS_CHECK
+	if (i>=Afac._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+	if (i>=Indx._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
+	for (int n=0; n<nmax; n++) {
+
+	  cuFP_t p0 =
+#if cuREAL == 4
+	    a*tex1D<float>(tex._v[0], ind  ) +
+	    b*tex1D<float>(tex._v[0], ind+1) ;
+#else
+	    a*int2_as_double(tex1D<int2>(tex._v[0], ind  )) +
+	    b*int2_as_double(tex1D<int2>(tex._v[0], ind+1)) ;
+#endif
+	  int k = 1 + l*nmax + n;
+
+#ifdef BOUNDS_CHECK
+	  if (k>=tex._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
+	  cuFP_t v = (
+#if cuREAL == 4
+		     a*tex1D<float>(tex._v[k], ind  ) +
+		     b*tex1D<float>(tex._v[k], ind+1)
+#else
+		     a*int2_as_double(tex1D<int2>(tex._v[k], ind  )) +
+		     b*int2_as_double(tex1D<int2>(tex._v[k], ind+1))
+#endif
+		      ) * p0 * plm[Ilm(l, m)] * fac0 * norm;
+	 
+	  local_coeff_sums[2*n] += v * cosp * mass;
+	  local_coeff_sums[2*n+1] += v * sinp * mass; 
+
+	  // Load work space
+	  //
+	  if (compute and tvar._s>0) {
+	    if (sphAcov) tvar._v[n*N + i   ] = v * mass;
+	    else         work._v[i*nmax + n] = v;
+	  }
+	  
+#ifdef BOUNDS_CHECK
+	  if ((2*n+0)*N+i>=coef._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+	  if ((2*n+1)*N+i>=coef._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
+	}
+
+	if (compute and not sphAcov and tvar._s>0) {
+
+	  int c = 0;
+	  // Variance computation
+	  for (int r=0; r<nmax; r++) {
+	    for (int s=r; s<nmax; s++) {
+	      tvar._v[N*c + i] =
+		work._v[i*nmax + r] * work._v[i*nmax + s] * mass;
+	      c++;
+	    }
+	  }
+	  // Mean computation
+	  for (int r=0; r<nmax; r++) {
+	    tvar._v[N*c + i] = work._v[i*nmax + r] * mass;
+	    c++;
+	  }
+	  if (c != nmax*(nmax+3)/2) printf("out of bounds: wrong c [k]\n");
+	}
+      } else {
+
+	if (compute and tvar._s>0) {
+	  if (sphAcov) {
+	    for (int n=0; n<nmax; n++) {
+	      tvar._v[n*N + i] = 0.0;
+	    }
+	  } else {
+	    int c = 0;
+	    for (int r=0; r<nmax; r++) {
+	      for (int s=r; s<nmax; s++) {
+		tvar._v[N*c + i] = 0.0;
+		c++;
+	      }
+	    }
+	    for (int r=0; r<nmax; r++) {
+	      tvar._v[N*c + i] = 0.0;
+	      c++;
+	    }
+	  }
+	}
+      }
+    }
+  }
+
+  for (int j = 0; j < NUM_RADIAL_COEFFS; j++)
+    shared_coeff_sums[tid*NUM_RADIAL_COEFFS + j] = local_coeff_sums[j];
+  __syncthreads();
+
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+    if (tid < offset) {
+      for (int j = 0; j < NUM_RADIAL_COEFFS; j++)
+        local_coeff_sums[j] += shared_coeff_sums[(tid + offset)*NUM_RADIAL_COEFFS + j];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    for (int j = 0; j < NUM_RADIAL_COEFFS; j++)
+      atomicAdd(&out_coef._v[j], local_coeff_sums[j]); // Atomic update to global result
+  }
+
+}
 
 __global__ void coefKernel
 (dArray<cuFP_t> coef, dArray<cuFP_t> tvar, dArray<cuFP_t> work,
@@ -1070,11 +1245,16 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 	// Compute the contribution to the coefficients from each
 	// particle
 	//
-	coefKernel<<<gridSize, BLOCK_SIZE, 0, cr->stream>>>
+	combinedCoefKernel<<<gridSize, BLOCK_SIZE, osize*sMemSize, cr->stream>>>
+          (toKernel(cuS.dw_coef), toKernel(cuS.dN_tvar), toKernel(cuS.dW_tvar),
+           toKernel(cuS.u_d), toKernel(t_d), toKernel(cuS.m_d),
+           toKernel(cuS.a_d), toKernel(cuS.p_d), toKernel(cuS.plm1_d),
+           toKernel(cuS.i_d), stride, l, m, Lmax, nmax, ft, cur, compute);
+	/*coefKernel<<<gridSize, BLOCK_SIZE, 0, cr->stream>>>
 	  (toKernel(cuS.dN_coef), toKernel(cuS.dN_tvar), toKernel(cuS.dW_tvar),
 	   toKernel(cuS.u_d), toKernel(t_d), toKernel(cuS.m_d),
 	   toKernel(cuS.a_d), toKernel(cuS.p_d), toKernel(cuS.plm1_d),
-	   toKernel(cuS.i_d), stride, l, m, Lmax, nmax, ft, cur, compute);
+	   toKernel(cuS.i_d), stride, l, m, Lmax, nmax, ft, cur, compute);*/
 	
 	// Begin the reduction per grid block [perhaps this should use
 	// a stride?]
@@ -1082,7 +1262,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 	unsigned int gridSize1 = N/BLOCK_SIZE;
 	if (N > gridSize1*BLOCK_SIZE) gridSize1++;
 
-	reduceSum<cuFP_t, BLOCK_SIZE>
+	/*reduceSum<cuFP_t, BLOCK_SIZE>
 	  <<<gridSize1, BLOCK_SIZE, sMemSize, cr->stream>>>
 	  (toKernel(cuS.dc_coef), toKernel(cuS.dN_coef), osize, N);
       
@@ -1103,7 +1283,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 			  cuS.dw_coef.begin(), cuS.dw_coef.end(),
 			  beg, beg, thrust::plus<cuFP_t>());
 	
-	thrust::advance(beg, osize);
+	thrust::advance(beg, osize);*/
 	
 	if (compute) {
 	  
