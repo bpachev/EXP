@@ -470,19 +470,20 @@ __global__ void combinedCoefKernel
     }
   }
 
+  int offset_in_block = threadIdx.x;
   for (int j = 0; j < NUM_RADIAL_COEFFS; j++)
-    shared_coeff_sums[tid*NUM_RADIAL_COEFFS + j] = local_coeff_sums[j];
+    shared_coeff_sums[offset_in_block*NUM_RADIAL_COEFFS + j] = local_coeff_sums[j];
   __syncthreads();
 
   for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
-    if (tid < offset) {
+    if (offset_in_block < offset) {
       for (int j = 0; j < NUM_RADIAL_COEFFS; j++)
-        local_coeff_sums[j] += shared_coeff_sums[(tid + offset)*NUM_RADIAL_COEFFS + j];
+        local_coeff_sums[j] += shared_coeff_sums[(offset_in_block + offset)*NUM_RADIAL_COEFFS + j];
     }
     __syncthreads();
   }
 
-  if (tid == 0) {
+  if (offset_in_block == 0) {
     for (int j = 0; j < NUM_RADIAL_COEFFS; j++)
       atomicAdd(&out_coef._v[j], local_coeff_sums[j]); // Atomic update to global result
   }
@@ -1166,6 +1167,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
   
   unsigned int Ntotal = lohi.second - lohi.first;
   unsigned int Npacks = Ntotal/component->bunchSize + 1;
+  size_t max_shared_mem = deviceProp.sharedMemPerBlock;
 
   // Loop over bunches
   //
@@ -1229,7 +1231,18 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
     int vsize = nmax*(nmax+3)/2;
     auto beg  = cuS.df_coef.begin();
     auto begV = cuS.df_tvar.begin();
+    int coef_block_size = BLOCK_SIZE;
+    while (coef_block_size > max_shared_mem / (osize * sizeof(cuFP_t)))
+      coef_block_size /= 2;
+    int coef_stride = N/coef_block_size/deviceProp.maxGridSize[0] + 1;
+    int coef_grid_size = N/coef_block_size/coef_stride + 1;
 
+    int max_shared_mem_fields = max_shared_mem / (BLOCK_SIZE * sizeof(cuFP_t));
+    //std::cout << "Max shmem fields " << max_shared_mem_fields << " osize " << osize
+	//    << " block size " << BLOCK_SIZE << " max block size " << deviceProp.maxThreadsPerBlock << std::endl;
+    //std::cout << "pcavar " << pcavar << " compute " << compute << " pcaeof " << pcaeof << std::endl;
+    //std::cout << "N " << N << " coef_block_size " << coef_block_size << " coef_grid_size " << coef_grid_size
+//	    << " coef_stride " << coef_stride << std::endl;
     std::vector<thrust::device_vector<cuFP_t>::iterator> bm;
     if (pcavar) {
       for (int T=0; T<sampT; T++) {
@@ -1245,20 +1258,23 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 	// Compute the contribution to the coefficients from each
 	// particle
 	//
-	combinedCoefKernel<<<gridSize, BLOCK_SIZE, osize*sMemSize, cr->stream>>>
+	combinedCoefKernel<<<coef_grid_size, coef_block_size, coef_block_size*osize*sizeof(cuFP_t), cr->stream>>>
           (toKernel(cuS.dw_coef), toKernel(cuS.dN_tvar), toKernel(cuS.dW_tvar),
            toKernel(cuS.u_d), toKernel(t_d), toKernel(cuS.m_d),
            toKernel(cuS.a_d), toKernel(cuS.p_d), toKernel(cuS.plm1_d),
-           toKernel(cuS.i_d), stride, l, m, Lmax, nmax, ft, cur, compute);
+           toKernel(cuS.i_d), coef_stride, l, m, Lmax, nmax, ft, cur, compute);
+	 //cudaStreamSynchronize(cr->stream);
+         //cuda_check_last_error_mpi("combinedCoef", __FILE__, __LINE__, myid);
+
 	/*coefKernel<<<gridSize, BLOCK_SIZE, 0, cr->stream>>>
 	  (toKernel(cuS.dN_coef), toKernel(cuS.dN_tvar), toKernel(cuS.dW_tvar),
 	   toKernel(cuS.u_d), toKernel(t_d), toKernel(cuS.m_d),
 	   toKernel(cuS.a_d), toKernel(cuS.p_d), toKernel(cuS.plm1_d),
-	   toKernel(cuS.i_d), stride, l, m, Lmax, nmax, ft, cur, compute);*/
+	   toKernel(cuS.i_d), stride, l, m, Lmax, nmax, ft, cur, compute);
 	
 	// Begin the reduction per grid block [perhaps this should use
 	// a stride?]
-	//
+	//*/
 	unsigned int gridSize1 = N/BLOCK_SIZE;
 	if (N > gridSize1*BLOCK_SIZE) gridSize1++;
 
@@ -1277,13 +1293,13 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 	   thrust::make_transform_iterator(index_begin, key_functor(gridSize1)),
 	   thrust::make_transform_iterator(index_end,   key_functor(gridSize1)),
 	   cuS.dc_coef.begin(), thrust::make_discard_iterator(), cuS.dw_coef.begin()
-	   );
+	   );*/
 
 	thrust::transform(thrust::cuda::par.on(cr->stream),
 			  cuS.dw_coef.begin(), cuS.dw_coef.end(),
 			  beg, beg, thrust::plus<cuFP_t>());
 	
-	thrust::advance(beg, osize);*/
+	thrust::advance(beg, osize);
 	
 	if (compute) {
 	  
@@ -1431,7 +1447,8 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
     // determination
     //
     thrust::sort(thrust::cuda::par.on(cr->stream), cuS.m_d.begin(), cuS.m_d.end());
-
+    cudaStreamSynchronize(cr->stream);
+    cuda_check_last_error_mpi("thrust sort", __FILE__, __LINE__, myid);
     // Call the kernel on a single thread
     // 
     thrust::device_vector<cuFP_t>::iterator it;
