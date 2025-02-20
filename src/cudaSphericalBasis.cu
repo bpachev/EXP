@@ -1273,6 +1273,16 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
   // Copy back coefficient data from device and load the host
   //
   thrust::host_vector<cuFP_t> ret = cuS.df_coef;
+  cuFP_t sum = 0.0;
+  for (int i = 0; i < ret.size(); i++)
+    sum += ret[i];
+  std::cout << "coefs sum: " << sum << std::endl;
+  if (sum > 0) {
+    std::cout << "coeffs=[";
+    for (int i =0; i < ret.size(); i++) std::cout << ret[i] << ", ";
+    std::cout << "]" << endl;
+    throw std::runtime_error("FOO!");
+  }
   int offst = 0;
   for (int l=0; l<=Lmax; l++) {
     for (int m=0; m<=l; m++) {
