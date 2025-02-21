@@ -190,6 +190,7 @@ protected:
     std::vector<thrust::device_vector<cuFP_t>> T_covr;
 
     void resize_coefs(int nmax, int Lmax, int N, int gridSize, int stride,
+		      int coefGridSize, int coefBlockSize,
 		      int sampT, bool pca, bool pcaeof, bool subsamp);
     void resize_acc  (int Lmax, int Nthread);
   };

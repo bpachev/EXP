@@ -342,8 +342,8 @@ __global__ void fullCombinedCoefKernel
 {
   const int tid = blockDim.x * blockIdx.x + threadIdx.x;
   // divide by two
-  const int num_coeffs = out_coef._s / 2;
   const int psiz  = (Lmax+1)*(Lmax+2)/2;
+  const int num_coeffs = psiz * nmax;
   const int coeff_index = tid % num_coeffs;
   const int N = (lohi.second - lohi.first);
   const int threads_per_coeff = 1 + (gridDim.x * blockDim.x - coeff_index - 1) / num_coeffs;
@@ -362,65 +362,76 @@ __global__ void fullCombinedCoefKernel
   for (int i = tid/num_coeffs; i < N; i += threads_per_coeff) {
       cuFP_t mass = Mass._v[i];
 
-#ifdef BOUNDS_CHECK
-      if (i>=Mass._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
-#endif
-
       if (mass>0.0) {
-#ifdef BOUNDS_CHECK
-	if (i>=Phi._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
-#endif
 	cuFP_t phi  = Phi._v[i];
 	cuFP_t cosp = cos(phi*m);
 	cuFP_t sinp = sin(phi*m);
-	
-#ifdef BOUNDS_CHECK
-	if (psiz*(i+1)>Plm._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
-#endif	
 	cuFP_t *plm = &Plm._v[psiz*i];
-	
-	// Do the interpolation
-	//
-	cuFP_t a = Afac._v[i];
-	cuFP_t b = 1.0 - a;
-	int  ind = Indx._v[i];
-	
-#ifdef BOUNDS_CHECK
-	if (i>=Afac._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
-	if (i>=Indx._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
-#endif
+  	
+        // Do the interpolation
+        //
+        cuFP_t a = Afac._v[i];
+        cuFP_t b = 1.0 - a;
+        int  ind = Indx._v[i];
 
-	  cuFP_t p0 =
+        cuFP_t p0 =
 #if cuREAL == 4
-	    a*tex1D<float>(tex._v[0], ind  ) +
-	    b*tex1D<float>(tex._v[0], ind+1) ;
+	  a*tex1D<float>(tex._v[0], ind  ) +
+	  b*tex1D<float>(tex._v[0], ind+1) ;
 #else
-	    a*int2_as_double(tex1D<int2>(tex._v[0], ind  )) +
-	    b*int2_as_double(tex1D<int2>(tex._v[0], ind+1)) ;
+  	  a*int2_as_double(tex1D<int2>(tex._v[0], ind  )) +
+	  b*int2_as_double(tex1D<int2>(tex._v[0], ind+1)) ;
 #endif
-	  int k = 1 + l*nmax + n;
+        int k = 1 + l*nmax + n;
 
-#ifdef BOUNDS_CHECK
-	  if (k>=tex._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
-#endif
-	  cuFP_t v = (
+        cuFP_t v = (
 #if cuREAL == 4
-		     a*tex1D<float>(tex._v[k], ind  ) +
-		     b*tex1D<float>(tex._v[k], ind+1)
+         a*tex1D<float>(tex._v[k], ind  ) +
+         b*tex1D<float>(tex._v[k], ind+1)
 #else
-		     a*int2_as_double(tex1D<int2>(tex._v[k], ind  )) +
-		     b*int2_as_double(tex1D<int2>(tex._v[k], ind+1))
+         a*int2_as_double(tex1D<int2>(tex._v[k], ind  )) +
+         b*int2_as_double(tex1D<int2>(tex._v[k], ind+1))
 #endif
-		      ) * p0 * plm[Ilm(l, m)] * fac0 * norm;
+        ) * p0 * plm[Ilm(l, m)] * fac0 * norm;
  
-      cos_sum += v * cosp * mass;
-      sin_sum += v * sinp * mass; 
-    }
+        cos_sum += v * cosp * mass;
+        sin_sum += v * sinp * mass; 
+      }
   }
   // TODO compare atomic reduction to
   // launching a second reduction kernel
-  atomicAdd(&out_coef._v[2*coeff_index], cos_sum);
-  atomicAdd(&out_coef._v[2*coeff_index+1], sin_sum);
+  //atomicAdd(&out_coef._v[2*coeff_index], cos_sum);
+  //atomicAdd(&out_coef._v[2*coeff_index+1], sin_sum);
+  int max_threads_per_coef = 1 + (gridDim.x * blockDim.x - 1) / num_coeffs;
+  int thread_num = tid / num_coeffs;
+  out_coef._v[2*coeff_index*max_threads_per_coef + thread_num] = cos_sum;
+  out_coef._v[(2*coeff_index+1)*max_threads_per_coef + thread_num] = sin_sum;
+}
+
+__global__ void coefReductionKernel(dArray<cuFP_t> out_coef, dArray<cuFP_t> partial_sums)
+{
+  extern __shared__ cuFP_t shared_sums[];
+  // Assume one block per coef
+  int coef_index = blockIdx.x;
+  int num_coefs = out_coef._s;
+  int entries_per_coef = partial_sums._s / num_coefs;
+  assert(coef_index < num_coefs);
+  assert(num_coefs * entries_per_coef == partial_sums._s);
+  cuFP_t* arr = &partial_sums._v[coef_index*entries_per_coef];
+  cuFP_t local_sum = 0.0;
+  for (int i = threadIdx.x; i < entries_per_coef; i += blockDim.x) {
+    local_sum += arr[i];
+  }
+
+  shared_sums[threadIdx.x] = local_sum;
+  __syncthreads();
+
+  for (int offset = blockDim.x/2; offset > 0; offset /= 2) {
+    if (threadIdx.x < offset) shared_sums[threadIdx.x] += shared_sums[threadIdx.x+offset];
+    __syncthreads();
+  }
+  
+  if (threadIdx.x == 0) out_coef._v[coef_index] = shared_sums[0];
 }
 
 __global__ void combinedCoefKernel
@@ -1055,6 +1066,7 @@ public:
 
 void SphericalBasis::cudaStorage::resize_coefs
 (int nmax, int Lmax, int N, int gridSize, int stride,
+ int coefGridSize, int coefBlockSize,
  int sampT, bool pcavar, bool pcaeof, bool subsamp)
 {
   // Create space for coefficient reduction to prevent continued
@@ -1063,8 +1075,16 @@ void SphericalBasis::cudaStorage::resize_coefs
   if (dN_coef.capacity() < 2*nmax*N)
     dN_coef.reserve(2*nmax*N);
   
-  if (dc_coef.capacity() < 2*nmax*gridSize)
-    dc_coef.reserve(2*nmax*gridSize);
+  int num_coefs = df_coef.size()/2;
+  int num_threads = coefGridSize * coefBlockSize;
+  int max_threads_per_coef = 1 + (num_threads-1) / num_coefs;
+  std::cout << "max_threads_per_coef " << max_threads_per_coef <<
+	  " num_coefs " << num_coefs << std::endl;
+  int dc_coef_size = max_threads_per_coef * num_coefs * 2;
+  if (dc_coef.capacity() < dc_coef_size)
+    dc_coef.resize(dc_coef_size);
+  //if (dc_coef.capacity() < 2*nmax*gridSize)
+  //  dc_coef.reserve(2*nmax*gridSize);
   
   if (plm1_d.capacity() < (Lmax+1)*(Lmax+2)/2*N)
     plm1_d.reserve((Lmax+1)*(Lmax+2)/2*N);
@@ -1105,7 +1125,8 @@ void SphericalBasis::cudaStorage::resize_coefs
   // Set needed space for current step
   //
   dN_coef.resize(2*nmax*N);
-  dc_coef.resize(2*nmax*gridSize);
+  dc_coef.resize(dc_coef_size);
+  //dc_coef.resize(2*nmax*gridSize);
 
   // This will stay fixed for the entire run
   //
@@ -1286,7 +1307,13 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
   unsigned int Ntotal = lohi.second - lohi.first;
   unsigned int Npacks = Ntotal/component->bunchSize + 1;
   size_t max_shared_mem = deviceProp.sharedMemPerBlock;
-
+  int minCoefGridSize;
+  int coefBlockSize;
+  cudaOccupancyMaxPotentialBlockSize(
+    &minCoefGridSize, &coefBlockSize, fullCombinedCoefKernel, 0, 0);
+  int minAllowedCoefGridSize = (cuS.df_coef.size() + coefBlockSize-1)/coefBlockSize;
+  unsigned int coefGridSize = std::max(minCoefGridSize, minAllowedCoefGridSize);
+  std::cout << "Using grid size " << coefGridSize << " block size " << coefBlockSize << std::endl;
   // Loop over bunches
   //
   for (int n=0; n<Npacks; n++) {
@@ -1328,6 +1355,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
     // Resize storage as needed
     //
     cuS.resize_coefs(nmax, Lmax, N, gridSize, stride,
+		     coefGridSize, coefBlockSize,
 		     sampT, pcavar, pcaeof, subsamp);
       
     // Shared memory size for the reduction
@@ -1342,15 +1370,18 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
        toKernel(cuS.plm1_d), toKernel(cuS.i_d),
        Lmax, stride, cur, rmax);
     
+    //std::cout << "starting combined coeff" << std::endl;
     // TODO: implement optional tvar computation
-    unsigned int minGridSize = (cuS.df_coef.size() + BLOCK_SIZE-1)/BLOCK_SIZE;
-    unsigned int coefGridSize = std::max(minGridSize, gridSize);
-    fullCombinedCoefKernel<<<coefGridSize, BLOCK_SIZE, 0, cr->stream>>>
-      (toKernel(cuS.df_coef), toKernel(t_d), toKernel(cuS.m_d),
+    fullCombinedCoefKernel<<<coefGridSize, coefBlockSize, 0, cr->stream>>>
+      (toKernel(cuS.dc_coef), toKernel(t_d), toKernel(cuS.m_d),
            toKernel(cuS.a_d), toKernel(cuS.p_d), toKernel(cuS.plm1_d),
            toKernel(cuS.i_d), Lmax, nmax, toKernel(cuS.l_list),
 	   toKernel(cuS.m_list), toKernel(cuS.norm_list), cur);
    
+    //cudaStreamSynchronize(cr->stream); std::cout << "Finished combined coeff" << std::endl;
+    coefReductionKernel<<<cuS.df_coef.size(), BLOCK_SIZE, BLOCK_SIZE*sizeof(cuFP_t), cr->stream>>>
+	    (toKernel(cuS.df_coef), toKernel(cuS.dc_coef));
+    //cudaStreamSynchronize(cr->stream); std::cout << "Finished reduction kernel" << std::endl;
     /* 
     // Compute the coefficient contribution for each order
     //
@@ -2285,6 +2316,15 @@ void SphericalBasis::multistep_update_cuda()
 
   auto cs = component->cuStream;
 
+  int minCoefGridSize;
+  int coefBlockSize;
+  cudaOccupancyMaxPotentialBlockSize(
+    &minCoefGridSize, &coefBlockSize, fullCombinedCoefKernel, 0, 0);
+  int minAllowedCoefGridSize = (cuS.df_coef.size() + coefBlockSize-1)/coefBlockSize;
+  unsigned int coefGridSize = std::max(minCoefGridSize, minAllowedCoefGridSize);
+  std::cout << "multilevel: Using grid size " << coefGridSize << " block size " << coefBlockSize << std::endl;
+
+
 #ifdef VERBOSE_TIMING
   double coord = 0.0, coefs = 0.0, reduc = 0.0;
 #endif
@@ -2340,6 +2380,7 @@ void SphericalBasis::multistep_update_cuda()
 	// Resize storage as needed
 	//
 	cuS.resize_coefs(nmax, Lmax, N, gridSize, stride,
+			 coefGridSize, coefBlockSize,
 			 sampT, pcavar, pcaeof, subsamp);
 	
 	// Shared memory size for the reduction
@@ -2357,13 +2398,15 @@ void SphericalBasis::multistep_update_cuda()
 	   toKernel(cuS.plm1_d), toKernel(cuS.i_d),
 	   Lmax, stride, cur, rmax);
         
-	unsigned int minGridSize = (cuS.df_coef.size() + BLOCK_SIZE-1)/BLOCK_SIZE;
-	unsigned int coefGridSize = std::max(minGridSize, gridSize);
-        fullCombinedCoefKernel<<<coefGridSize, BLOCK_SIZE, 0, cs->stream>>>
-          (toKernel(cuS.df_coef), toKernel(t_d), toKernel(cuS.m_d),
+
+        fullCombinedCoefKernel<<<coefGridSize, coefBlockSize, 0, cs->stream>>>
+          (toKernel(cuS.dc_coef), toKernel(t_d), toKernel(cuS.m_d),
            toKernel(cuS.a_d), toKernel(cuS.p_d), toKernel(cuS.plm1_d),
            toKernel(cuS.i_d), Lmax, nmax, toKernel(cuS.l_list),
            toKernel(cuS.m_list), toKernel(cuS.norm_list), cur);
+        coefReductionKernel<<<cuS.df_coef.size(), BLOCK_SIZE, BLOCK_SIZE*sizeof(cuFP_t), cs->stream>>>
+	    (toKernel(cuS.df_coef), toKernel(cuS.dc_coef));
+	
 #ifdef VERBOSE_TIMING
 	finish = std::chrono::high_resolution_clock::now();
 	duration = finish - start;
