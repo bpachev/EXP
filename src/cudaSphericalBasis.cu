@@ -347,19 +347,20 @@ __global__ void fullCombinedCoefKernel
   const int coeff_index = tid % num_coeffs;
   const int N = (lohi.second - lohi.first);
   const int threads_per_coeff = 1 + (gridDim.x * blockDim.x - coeff_index - 1) / num_coeffs;
-  
-  const int n = coeff_index % nmax;
-  const int lm = coeff_index / nmax;
-  assert(l_list._s > lm);
-  const int l = l_list._v[lm];
-  const int m = m_list._v[lm];
-  const cuFP_t norm = norm_list._v[lm];
+  const int NUM_LOCAL_COEFFS = 2*nmax;
+  cuFP_t local_coeff_sums[MAX_RADIAL_COEFFS];
 
   cuFP_t cos_sum = 0.0;
   cuFP_t sin_sum = 0.0;
   const cuFP_t fac0 = -4.0*M_PI;
-  
-  for (int i = tid/num_coeffs; i < N; i += threads_per_coeff) {
+ 
+  for (int l = 0; l <= Lmax; l++) {
+    for (int m = 0; m <= l; m++) {
+    int lm = Ilm(l, m);
+    cuFP_t norm = norm_list._v[lm];  
+    for (int n = 0; n < NUM_LOCAL_COEFFS; n++) local_coeff_sums[n] = 0;
+    
+    for (int i = tid; i < N; i += gridDim.x*blockDim.x) {
       cuFP_t mass = Mass._v[i];
 
       if (mass>0.0) {
@@ -382,6 +383,7 @@ __global__ void fullCombinedCoefKernel
   	  a*int2_as_double(tex1D<int2>(tex._v[0], ind  )) +
 	  b*int2_as_double(tex1D<int2>(tex._v[0], ind+1)) ;
 #endif
+	for (int n = 0; n < nmax; n++) {
         int k = 1 + l*nmax + n;
 
         cuFP_t v = (
@@ -394,18 +396,17 @@ __global__ void fullCombinedCoefKernel
 #endif
         ) * p0 * plm[Ilm(l, m)] * fac0 * norm;
  
-        cos_sum += v * cosp * mass;
-        sin_sum += v * sinp * mass; 
+        local_coeff_sums[n*2] += v * cosp * mass;
+        local_coeff_sums[n*2+1] += v * sinp * mass;
+        }
       }
-  }
-  // TODO compare atomic reduction to
-  // launching a second reduction kernel
-  //atomicAdd(&out_coef._v[2*coeff_index], cos_sum);
-  //atomicAdd(&out_coef._v[2*coeff_index+1], sin_sum);
-  int max_threads_per_coef = 1 + (gridDim.x * blockDim.x - 1) / num_coeffs;
-  int thread_num = tid / num_coeffs;
-  out_coef._v[2*coeff_index*max_threads_per_coef + thread_num] = cos_sum;
-  out_coef._v[(2*coeff_index+1)*max_threads_per_coef + thread_num] = sin_sum;
+    }
+
+    for (int j = 0; j < NUM_LOCAL_COEFFS; j++) {
+      out_coef._v[(lm*NUM_LOCAL_COEFFS + j)*gridDim.x*blockDim.x + tid] = local_coeff_sums[j];
+    }
+  } // m-loop
+  } // l-loop
 }
 
 __global__ void coefReductionKernel(dArray<cuFP_t> out_coef, dArray<cuFP_t> partial_sums)
@@ -1075,14 +1076,10 @@ void SphericalBasis::cudaStorage::resize_coefs
   if (dN_coef.capacity() < 2*nmax*N)
     dN_coef.reserve(2*nmax*N);
   
-  int num_coefs = df_coef.size()/2;
-  int num_threads = coefGridSize * coefBlockSize;
-  int max_threads_per_coef = 1 + (num_threads-1) / num_coefs;
-  std::cout << "max_threads_per_coef " << max_threads_per_coef <<
-	  " num_coefs " << num_coefs << std::endl;
-  int dc_coef_size = max_threads_per_coef * num_coefs * 2;
+  int dc_coef_size = df_coef.size() * coefGridSize * coefBlockSize;
   if (dc_coef.capacity() < dc_coef_size)
-    dc_coef.resize(dc_coef_size);
+    dc_coef.reserve(dc_coef_size);
+  dc_coef.resize(dc_coef_size);
   //if (dc_coef.capacity() < 2*nmax*gridSize)
   //  dc_coef.reserve(2*nmax*gridSize);
   
@@ -1125,7 +1122,6 @@ void SphericalBasis::cudaStorage::resize_coefs
   // Set needed space for current step
   //
   dN_coef.resize(2*nmax*N);
-  dc_coef.resize(dc_coef_size);
   //dc_coef.resize(2*nmax*gridSize);
 
   // This will stay fixed for the entire run
