@@ -181,6 +181,10 @@ protected:
     thrust::device_vector<cuFP_t> dw_tvar;
     thrust::device_vector<cuFP_t> df_tvar;
     thrust::device_vector<cuFP_t> plm1_d, plm2_d, r_d, m_d, u_d, a_d, p_d;
+    // precomputed list of factorials
+    thrust::device_vector<cuFP_t> norm_list;
+    // precomputed lists of l and m indices
+    thrust::device_vector<int> l_list, m_list;
     thrust::device_vector<int   > i_d;
     
     std::vector<thrust::device_vector<cuFP_t>> T_covr;
