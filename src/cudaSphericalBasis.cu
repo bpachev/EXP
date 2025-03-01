@@ -432,7 +432,7 @@ __global__ void coefReductionKernel(dArray<cuFP_t> out_coef, dArray<cuFP_t> part
     __syncthreads();
   }
   
-  if (threadIdx.x == 0) out_coef._v[coef_index] = shared_sums[0];
+  if (threadIdx.x == 0) out_coef._v[coef_index] += shared_sums[0];
 }
 
 __global__ void combinedCoefKernel
@@ -1309,7 +1309,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
     &minCoefGridSize, &coefBlockSize, fullCombinedCoefKernel, 0, 0);
   int minAllowedCoefGridSize = (cuS.df_coef.size() + coefBlockSize-1)/coefBlockSize;
   unsigned int coefGridSize = std::max(minCoefGridSize, minAllowedCoefGridSize);
-  std::cout << "Using grid size " << coefGridSize << " block size " << coefBlockSize << std::endl;
+  //std::cout << "Using grid size " << coefGridSize << " block size " << coefBlockSize << std::endl;
   // Loop over bunches
   //
   for (int n=0; n<Npacks; n++) {
@@ -1653,7 +1653,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
       offst += nmax*2;
     }
   }
-  std::cout << "exiting determine coeffs cuda" << std::endl;
+  //std::cout << "exiting determine coeffs cuda" << std::endl;
   if (Ntotal == 0) {
     return;
   }
