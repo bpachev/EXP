@@ -54,6 +54,14 @@ int Ilmn(int l, int m, char cs, int n, int nmax)
   return ret;
 }
 
+int get_threads_per_particle(int nmax, int max_coeffs_per_thread)
+{
+  int min_threads_per_particle = 1 + (nmax-1) / max_coeffs_per_thread;
+  int threads_per_particle = 1;
+  while (threads_per_particle < min_threads_per_particle) threads_per_particle *= 2;
+  return threads_per_particle;
+}
+
 // compute a single legendre coefficient as needed
 __host__ __device__
 cuFP_t legendre_scalar(int l, int m, cuFP_t x)
@@ -346,21 +354,13 @@ __global__ void coordKernel
 
 __global__ void coefReductionKernel(
  dArray<cuFP_t> out, dArray<cuFP_t> coef, dArray<cuFP_t> Phi, dArray<cuFP_t> theta,
- int l, int m, unsigned int nmax, cuFP_t norm,  PII lohi
+ int l, int m, unsigned int nmax, cuFP_t norm,  PII lohi, int threads_per_particle
 )
 {
   extern __shared__ cuFP_t shared[];
   const int tid = blockDim.x * blockIdx.x + threadIdx.x;
   const int total_threads = blockDim.x  * gridDim.x;
   const int N     = lohi.second - lohi.first;
-  // TODO is it worth forcing this to be a power of 2?
-  // I think so as it will greatly simplify the reduction logic
-  int threads_per_particle = 1 + (nmax-1) / MAX_COEFFS_PER_THREAD;
-  int pow2 = 1;
-  while (threads_per_particle > pow2) pow2 *= 2;
-  threads_per_particle = pow2;
-  // This way we know for sure each block handles a number of particles
-  // simultaneously that is divisible by 2
   const int stride = total_threads / threads_per_particle;
   const int coeffs_per_thread = 1 + (nmax-1) / threads_per_particle;
   const int coeff_offset = coeffs_per_thread * (tid % threads_per_particle);
@@ -1174,13 +1174,18 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 	//
 	unsigned int gridSize1 = N/BLOCK_SIZE;
 	if (N > gridSize1*BLOCK_SIZE) gridSize1++;
-        unsigned int threads_per_particle = 1 + (nmax-1) / MAX_COEFFS_PER_THREAD;
+	size_t maxSMem = deviceProp.sharedMemPerBlock;
+	int max_coeffs_per_thread = maxSMem / (2*BLOCK_SIZE * sizeof(cuFP_t));
+	if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
+	int threads_per_particle = get_threads_per_particle(nmax, max_coeffs_per_thread);
 	unsigned int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_particle);
 	int redSMemSize = coeffs_per_thread*sMemSize;
+
+	
 	coefReductionKernel
           <<<gridSize1, BLOCK_SIZE, redSMemSize, cr->stream>>>
 	  (toKernel(cuS.dc_coef), toKernel(cuS.dN_coef), toKernel(cuS.p_d),
-	   toKernel(cuS.theta_d), l, m, nmax, ft, cur);
+	   toKernel(cuS.theta_d), l, m, nmax, ft, cur, threads_per_particle);
 	//reduceSum<cuFP_t, BLOCK_SIZE>
 	//  <<<gridSize1, BLOCK_SIZE, sMemSize, cr->stream>>>
 	//  (toKernel(cuS.dc_coef), toKernel(cuS.dN_coef), osize, N);
@@ -2163,13 +2168,17 @@ void SphericalBasis::multistep_update_cuda()
 	    //
 	    unsigned int gridSize1 = N/BLOCK_SIZE;
 	    if (N > gridSize1*BLOCK_SIZE) gridSize1++;
-            unsigned int threads_per_particle = 1 + (nmax-1) / MAX_COEFFS_PER_THREAD;
-            unsigned int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_particle);
+                    size_t maxSMem = deviceProp.sharedMemPerBlock;
+            int max_coeffs_per_thread = maxSMem / (2*BLOCK_SIZE * sizeof(cuFP_t));
+            if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
+            int threads_per_particle = get_threads_per_particle(nmax, max_coeffs_per_thread);
+            int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_particle);
             int redSMemSize = coeffs_per_thread*sMemSize;
+
 	    coefReductionKernel
               <<<gridSize1, BLOCK_SIZE, redSMemSize, cs->stream>>>
               (toKernel(cuS.dc_coef), toKernel(cuS.dN_coef), toKernel(cuS.p_d),
-               toKernel(cuS.theta_d), l, m, nmax, ft, cur);
+               toKernel(cuS.theta_d), l, m, nmax, ft, cur, threads_per_particle);
 
 	    //reduceSum<cuFP_t, BLOCK_SIZE>
 	    //  <<<gridSize1, BLOCK_SIZE, sMemSize, cs->stream>>>
