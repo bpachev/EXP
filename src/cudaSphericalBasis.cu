@@ -352,6 +352,11 @@ __global__ void coordKernel
   }
 }
 
+__global__ void coefComputeReduceKernel()
+{
+   return;
+}
+
 __global__ void coefReductionKernel(
  dArray<cuFP_t> out, dArray<cuFP_t> coef, dArray<cuFP_t> Phi, dArray<cuFP_t> theta,
  int l, int m, unsigned int nmax, cuFP_t norm,  PII lohi, int threads_per_particle
@@ -555,6 +560,8 @@ forceKernel(dArray<cudaParticle> P, dArray<int> I, dArray<cuFP_t> coef,
 {
   const int tid   = blockDim.x * blockIdx.x + threadIdx.x;
   const int psiz  = (Lmax+1)*(Lmax+2)/2;
+  const int num_coeff_bunches = 1 + (nmax-1) / MAX_COEFFS_PER_THREAD;
+  cuFP_t velocities[2*MAX_COEFFS_PER_THREAD];
 
   for (int n=0; n<stride; n++) {
     int i     = tid*stride + n;	// Index in the stride
@@ -665,6 +672,9 @@ forceKernel(dArray<cudaParticle> P, dArray<int> I, dArray<cuFP_t> coef,
 	cuFP_t ccos = 1.0;	// For recursion
 	cuFP_t ssin = 0.0;
 
+	// coeff bunch loop
+        //
+	for (int coeff_bunch_num = 0; coeff_bunch_num < num_coeff_bunches; coeff_bunch_num++) {
 	// m loop
 	//
 	for (int m=0; m<=l; m++) {
@@ -695,8 +705,10 @@ forceKernel(dArray<cudaParticle> P, dArray<int> I, dArray<cuFP_t> coef,
 	  int indxC = Ilmn(l, m, 'c', 0, nmax);
 	  int indxS = Ilmn(l, m, 's', 0, nmax);
 
-	  for (size_t n=0; n<nmax; n++) {
-	
+	  for (size_t n=coeff_bunch_num*MAX_COEFFS_PER_THREAD; (n<nmax) && (n<(coeff_bunch_num+1)*MAX_COEFFS_PER_THREAD); n++) {
+	    cuFP_t v, dv;
+	    int index = n - coeff_bunch_num*MAX_COEFFS_PER_THREAD;
+	    if (m == 0) {
 	    int k = 1 + l*nmax + n;
 	
 #ifdef BOUNDS_CHECK
@@ -723,9 +735,9 @@ forceKernel(dArray<cudaParticle> P, dArray<int> I, dArray<cuFP_t> coef,
 	      u0 = int2_as_double(tex1D<int2>(tex._v[k], 0));
 	    }
 #endif
-	    cuFP_t v = (a0*u0 + b0*u1)*(a0*p0 + b0*p1);
+	    velocities[2*index] = v = (a0*u0 + b0*u1)*(a0*p0 + b0*p1);
 	    
-	    cuFP_t dv =
+	    velocities[2*index+1] = dv =
 	      dx * ( (b1 - 0.5)*um1*pm1 - 2.0*b1*u00*p00 + (b1 + 0.5)*up1*pp1 );
 	    
 #ifdef NAN_CHECK
@@ -735,7 +747,11 @@ forceKernel(dArray<cudaParticle> P, dArray<int> I, dArray<cuFP_t> coef,
 	    if (std::isnan(dv))
 	      printf("dv tab nan: (%d, %d): a=%f b=%f pn=%f p0=%f pp=%f un=%f u0=%f up=%f\n", l, m, a1, b1, pm1, p00, pp1, um1, u00, up1);
 #endif
-
+            }
+	    else {
+              v = velocities[2*index];
+	      dv = velocities[2*index+1];
+	    }
 	    pp_c +=  v * coef._v[indxC+n];
 	    dp_c += dv * coef._v[indxC+n];
 	    if (m>0) {
@@ -818,6 +834,7 @@ forceKernel(dArray<cudaParticle> P, dArray<int> I, dArray<cuFP_t> coef,
 	  ssin = sinM * cosp + cosM * sinp;
 
 	} // END: m loop
+	} // END: coeff_bunch loop
 
       } // END: l loop
 
