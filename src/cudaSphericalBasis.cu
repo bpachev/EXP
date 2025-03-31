@@ -406,9 +406,51 @@ __global__ void coefComputeReduceKernel(
       __syncthreads();
   }
 
-  if (offset_in_block < 2*nmax*(l+1))
-    out._v[blockIdx.x + offset_in_block * gridDim.x] = shared[offset_in_block];
-   return;
+  for (int i = offset_in_block; i < coeffs_per_particle; i +=  blockDim.x)
+    out._v[blockIdx.x + i * gridDim.x] = shared[i];
+  return;
+
+  // We can't assume that threads_per_particle is a power of two
+  // This is the reason for the below algorithm
+  /*for (int chunks = 1 + (blockDim.x-1) / threads_per_particle; chunks > 1; chunks = (chunks+1)/2) {
+    int offset = ((chunks+1)/2) * threads_per_particle;
+    if (offset_in_block+offset < blockDim.x) {
+      for (int n = 0; n < 2*coeffs_per_thread; n++) {
+        shared[offset_in_block*2*coeffs_per_thread + n] += shared[(offset_in_block+offset)*2*coeffs_per_thread+n];
+      }
+    }
+    __syncthreads();
+  }
+
+
+  if (offset_in_block < threads_per_particle) {
+    for (int n = coeff_offset; n < coeff_offset+coeffs_per_thread; n++) {
+      if (n < nmax) {
+        out._v[blockIdx.x + 2*(m*nmax+n) * gridDim.x] = shared[offset_in_block*2*coeffs_per_thread + 2*n];
+	out._v[blockIdx.x + (2*(m*nmax+n)+1) * gridDim.x] = shared[offset_in_block*2*coeffs_per_thread + 2*n+1];
+      }
+    }
+  }*/
+
+  // Becuase threads_per_particle isn't necessarily a power of two, the first
+  // thread in the block could be processing a set of coefficients not corresponding
+  // to m=0. We could have each thread write the accumulated coefficients from its portion of
+  // shared memory - however this would result in 2*coeffs_per_thread writes for each thread
+  // The below approach recruits as many threads as possible to do the writing.
+  // This should slightly help performance, but probably not significantly
+  /*for (int i = offset_in_block; i += blockDim.x; i < threads_per_particle*coeffs_per_thread) {
+    // determine the thread that created this coefficient
+    int local_tid = i / coeffs_per_thread;
+    int global_tid = local_tid + blockIdx.x * blockDim.x;
+    int particle_offset = global_tid % threads_per_particle;
+    int m = particle_offset / threads_per_m;
+    int coeff_offset = coeffs_per_thread * (particle_offset % threads_per_m);
+    int n = coeff_offset + i % coeffs_per_thread;
+    if (n < nmax) {
+      out._v[blockIdx.x + 2*(m*nmax+n) * gridDim.x] = shared[2*i];
+      out._v[blockIdx.x + (2*(m*nmax+n)+1) * gridDim.x] = shared[2*i+1];
+    }
+  }*/
 }
 
 __global__ void coefReductionKernel(
@@ -952,8 +994,8 @@ void SphericalBasis::cudaStorage::resize_coefs
   if (dN_coef.capacity() < 2*nmax*N)
     dN_coef.reserve(2*nmax*N);
   
-  if (dc_coef.capacity() < 2*nmax*gridSize)
-    dc_coef.reserve(2*nmax*gridSize);
+  if (dc_coef.capacity() < (Lmax+1)*2*nmax*gridSize)
+    dc_coef.reserve((Lmax+1)*2*nmax*gridSize);
   
   //if (plm1_d.capacity() < (Lmax+1)*(Lmax+2)/2*N)
   //  plm1_d.reserve((Lmax+1)*(Lmax+2)/2*N);
@@ -1262,14 +1304,14 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 	int max_coeffs_per_thread = maxSMem / (2*coefBlockSize * sizeof(cuFP_t));
 	if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
         int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
-        int threads_per_particle = (l+1) * threads_per_m;
-	//int threads_per_particle = get_next_pow2(threads_per_m * (l+1));
-
+        //int threads_per_particle = (l+1) * threads_per_m;
+        if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
+	int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
         int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_m);
         int redSMemSize = coeffs_per_thread*coefBlockSize * sizeof(cuFP_t);
         if (threads_per_particle > coefBlockSize) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));
         //std::cout << "coefs per thread " << coeffs_per_thread << " threads per particle " << threads_per_particle << " threads per m " <<
-	//	threads_per_m << std::endl;
+	//	threads_per_m << " block size " << coefBlockSize << " grid size " << gridSize1 << " nmax " << nmax << std::endl;
         coefComputeReduceKernel
           <<<gridSize1, coefBlockSize, redSMemSize, cr->stream>>>
            (toKernel(cuS.dc_coef), toKernel(cuS.dN_coef), toKernel(cuS.p_d),
@@ -2259,20 +2301,39 @@ void SphericalBasis::multistep_update_cuda()
 	    // [perhaps this should use a stride?]
 	    //
 
-	  unsigned int gridSize1 = N/BLOCK_SIZE;
+	  /*unsigned int gridSize1 = N/BLOCK_SIZE;
           if (N > gridSize1*BLOCK_SIZE) gridSize1++;
           size_t maxSMem = deviceProp.sharedMemPerBlock;
           int max_coeffs_per_thread = maxSMem / (2*BLOCK_SIZE * sizeof(cuFP_t));
           if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
           int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
-	  int threads_per_particle = get_next_pow2(threads_per_m * (l+1));
-
+	  //int threads_per_particle = threads_per_m * (l+1);
+          if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
+          int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
           int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_m);
           int redSMemSize = coeffs_per_thread*sMemSize;
-	  if (threads_per_particle > BLOCK_SIZE) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));
+	  if (threads_per_particle > BLOCK_SIZE) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));*/
+        int minCoefGridSize;
+        int coefBlockSize;
+        cudaOccupancyMaxPotentialBlockSize(
+           &minCoefGridSize, &coefBlockSize, coefComputeReduceKernel, 0, BLOCK_SIZE/2);
+	unsigned int gridSize1 = minCoefGridSize;
+	//std::cout << "block size " << coefBlockSize << " grid size " << gridSize1 << std::endl;
+	
+        size_t maxSMem = deviceProp.sharedMemPerBlock;
+	int max_coeffs_per_thread = maxSMem / (2*coefBlockSize * sizeof(cuFP_t));
+	if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
+        int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
+        //int threads_per_particle = (l+1) * threads_per_m;
+        if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
+	int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
+        int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_m);
+        int redSMemSize = coeffs_per_thread*coefBlockSize * sizeof(cuFP_t);
+        if (threads_per_particle > coefBlockSize) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));
+
 
 	  coefComputeReduceKernel
-            <<<gridSize1, BLOCK_SIZE, redSMemSize, cs->stream>>>
+            <<<gridSize1, coefBlockSize, redSMemSize, cs->stream>>>
             (toKernel(cuS.dc_coef), toKernel(cuS.dN_coef), toKernel(cuS.p_d),
              toKernel(cuS.theta_d), l, nmax, Lmax, toKernel(cuS.factorial_d), cur,
 	     threads_per_particle, threads_per_m);
