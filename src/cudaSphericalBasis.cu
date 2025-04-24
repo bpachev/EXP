@@ -1342,7 +1342,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 	   );
 
 	thrust::transform(thrust::cuda::par.on(cr->stream),
-			  cuS.dw_coef.begin(), cuS.dw_coef.end(),
+			  cuS.dw_coef.begin(), cuS.dw_coef.begin()+osize*(l+1),
 			  beg, beg, thrust::plus<cuFP_t>());
 	
 	thrust::advance(beg, osize*(l+1));
@@ -2325,11 +2325,6 @@ void SphericalBasis::multistep_update_cuda()
           int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_m);
           int redSMemSize = coeffs_per_thread*sMemSize;
 	  if (threads_per_particle > BLOCK_SIZE) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));*/
-        int minCoefGridSize;
-        int coefBlockSize;
-        cudaOccupancyMaxPotentialBlockSize(
-           &minCoefGridSize, &coefBlockSize, coefComputeReduceKernel, 0, BLOCK_SIZE/2);
-	unsigned int gridSize1 = minCoefGridSize;
 	//std::cout << "block size " << coefBlockSize << " grid size " << gridSize1 << std::endl;
 	
         size_t maxSMem = deviceProp.sharedMemPerBlock;
