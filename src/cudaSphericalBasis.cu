@@ -372,11 +372,13 @@ __global__ void coefComputeReduceKernel(
   const int coeffs_per_particle = 2*nmax*(l+1);
   // coeffs_per_particle MUST be less than block size, or a reduction won't work!
   cuFP_t local_sums[2*MAX_COEFFS_PER_THREAD];
-  cuFP_t norm = factorial._v[(Lmax+1)*l + m];
+  cuFP_t norm = (m <= l) ? factorial._v[(Lmax+1)*l + m] : 0;
 
   for (int n = 0; n < 2*coeffs_per_thread; n++) local_sums[n] = 0;
+  //if (tid < threads_per_particle) printf("thread: %d, m %d, coeff_offset %d, threads_per_m %d, l %d, norm %f\n", tid, m, coeff_offset, threads_per_m, l, norm);
 
   for (int i = tid/threads_per_particle; i < N; i += stride) {
+    if (tid/threads_per_particle >=stride) break; // exclude any partial thread groups
     cuFP_t phi  = Phi._v[i];
     cuFP_t cosp = cos(phi*m);
     cuFP_t sinp = sin(phi*m);
@@ -398,6 +400,7 @@ __global__ void coefComputeReduceKernel(
 
   __syncthreads();
 
+  /*
   for (int offset = blockDim.x/2; offset >= threads_per_particle; offset /= 2) {
     for (int n = 0; n < 2*coeffs_per_thread; n++) {
       if (offset_in_block < offset)
@@ -408,13 +411,14 @@ __global__ void coefComputeReduceKernel(
 
   for (int i = offset_in_block; i < coeffs_per_particle; i +=  blockDim.x)
     out._v[blockIdx.x + i * gridDim.x] = shared[i];
-  return;
+  return;*/
 
   // We can't assume that threads_per_particle is a power of two
   // This is the reason for the below algorithm
-  /*for (int chunks = 1 + (blockDim.x-1) / threads_per_particle; chunks > 1; chunks = (chunks+1)/2) {
+  for (int chunks = 1 + (blockDim.x-1) / threads_per_particle; chunks > 1; chunks = (chunks+1)/2) {
     int offset = ((chunks+1)/2) * threads_per_particle;
-    if (offset_in_block+offset < blockDim.x) {
+    int mychunk = offset_in_block/threads_per_particle;
+    if ((offset_in_block + offset < blockDim.x) && (mychunk < chunks/2)) {
       for (int n = 0; n < 2*coeffs_per_thread; n++) {
         shared[offset_in_block*2*coeffs_per_thread + n] += shared[(offset_in_block+offset)*2*coeffs_per_thread+n];
       }
@@ -423,14 +427,15 @@ __global__ void coefComputeReduceKernel(
   }
 
 
-  if (offset_in_block < threads_per_particle) {
-    for (int n = coeff_offset; n < coeff_offset+coeffs_per_thread; n++) {
+  if ((offset_in_block < threads_per_particle)&&(m<=l)) {
+    for (int idx = 0; idx < coeffs_per_thread; idx++) {
+      int n = idx + coeff_offset;
       if (n < nmax) {
-        out._v[blockIdx.x + 2*(m*nmax+n) * gridDim.x] = shared[offset_in_block*2*coeffs_per_thread + 2*n];
-	out._v[blockIdx.x + (2*(m*nmax+n)+1) * gridDim.x] = shared[offset_in_block*2*coeffs_per_thread + 2*n+1];
+        out._v[blockIdx.x + 2*(m*nmax+n) * gridDim.x] = shared[offset_in_block*2*coeffs_per_thread + 2*idx];
+	out._v[blockIdx.x + (2*(m*nmax+n)+1) * gridDim.x] = shared[offset_in_block*2*coeffs_per_thread + 2*idx+1];
       }
     }
-  }*/
+  }
 
   // Becuase threads_per_particle isn't necessarily a power of two, the first
   // thread in the block could be processing a set of coefficients not corresponding
@@ -1037,11 +1042,11 @@ void SphericalBasis::cudaStorage::resize_coefs
   // Set needed space for current step
   //
   dN_coef.resize(2*nmax*N);
-  dc_coef.resize(2*nmax*gridSize);
+  dc_coef.resize(2*nmax*gridSize*(Lmax+1));
 
   // This will stay fixed for the entire run
   //
-  dw_coef.resize(2*nmax);
+  dw_coef.resize(2*nmax*(Lmax+1));
 
   // Space for Legendre coefficients 
   //
@@ -1202,6 +1207,11 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
   
   unsigned int Ntotal = lohi.second - lohi.first;
   unsigned int Npacks = Ntotal/component->bunchSize + 1;
+  int minCoefGridSize;
+  int coefBlockSize;
+  cudaOccupancyMaxPotentialBlockSize(
+           &minCoefGridSize, &coefBlockSize, coefComputeReduceKernel, 0, BLOCK_SIZE/2);
+  unsigned int gridSize1 = minCoefGridSize;
 
   // Loop over bunches
   //
@@ -1243,7 +1253,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
     
     // Resize storage as needed
     //
-    cuS.resize_coefs(nmax, Lmax, N, gridSize, stride,
+    cuS.resize_coefs(nmax, Lmax, N, gridSize1, stride,
 		     sampT, pcavar, pcaeof, subsamp);
       
     // Shared memory size for the reduction
@@ -1293,20 +1303,17 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 	//
 	//unsigned int gridSize1 = N/BLOCK_SIZE;
 	//if (N > gridSize1*BLOCK_SIZE) gridSize1++;
-        int minCoefGridSize;
-        int coefBlockSize;
-        cudaOccupancyMaxPotentialBlockSize(
-           &minCoefGridSize, &coefBlockSize, coefComputeReduceKernel, 0, BLOCK_SIZE/2);
-	unsigned int gridSize1 = minCoefGridSize;
+
 	//std::cout << "block size " << coefBlockSize << " grid size " << gridSize1 << std::endl;
 	
         size_t maxSMem = deviceProp.sharedMemPerBlock;
 	int max_coeffs_per_thread = maxSMem / (2*coefBlockSize * sizeof(cuFP_t));
 	if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
-        int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
-        //int threads_per_particle = (l+1) * threads_per_m;
-        if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
-	int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
+	int threads_per_m = 1 + (nmax-1) / max_coeffs_per_thread;
+        //int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
+        int threads_per_particle = (l+1) * threads_per_m;
+        //if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
+	//int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
         int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_m);
         int redSMemSize = coeffs_per_thread*coefBlockSize * sizeof(cuFP_t);
         if (threads_per_particle > coefBlockSize) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));
@@ -2187,6 +2194,11 @@ void SphericalBasis::multistep_update_cuda()
   cuda_check_last_error_mpi("cudaGetDeviceProperties", __FILE__, __LINE__, myid);
 
   auto cs = component->cuStream;
+  int minCoefGridSize;
+  int coefBlockSize;
+  cudaOccupancyMaxPotentialBlockSize(
+         &minCoefGridSize, &coefBlockSize, coefComputeReduceKernel, 0, BLOCK_SIZE/2);
+  unsigned int gridSize1 = minCoefGridSize; 
 
 #ifdef VERBOSE_TIMING
   double coord = 0.0, coefs = 0.0, reduc = 0.0;
@@ -2242,7 +2254,7 @@ void SphericalBasis::multistep_update_cuda()
 
 	// Resize storage as needed
 	//
-	cuS.resize_coefs(nmax, Lmax, N, gridSize, stride,
+	cuS.resize_coefs(nmax, Lmax, N, gridSize1, stride,
 			 sampT, pcavar, pcaeof, subsamp);
 	
 	// Shared memory size for the reduction
@@ -2323,10 +2335,11 @@ void SphericalBasis::multistep_update_cuda()
         size_t maxSMem = deviceProp.sharedMemPerBlock;
 	int max_coeffs_per_thread = maxSMem / (2*coefBlockSize * sizeof(cuFP_t));
 	if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
-        int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
-        //int threads_per_particle = (l+1) * threads_per_m;
-        if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
-	int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
+        //int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
+        int threads_per_m = 1 + (nmax-1) / max_coeffs_per_thread;
+	int threads_per_particle = (l+1) * threads_per_m;
+        //if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
+	//int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
         int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_m);
         int redSMemSize = coeffs_per_thread*coefBlockSize * sizeof(cuFP_t);
         if (threads_per_particle > coefBlockSize) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));
@@ -2357,7 +2370,7 @@ void SphericalBasis::multistep_update_cuda()
 	       );
 	    
 	    thrust::transform(thrust::cuda::par.on(cs->stream),
-			      cuS.dw_coef.begin(), cuS.dw_coef.end(),
+			      cuS.dw_coef.begin(), cuS.dw_coef.begin()+osize*(l+1),
 			      beg, beg, thrust::plus<cuFP_t>());
 
 #ifdef VERBOSE_TIMING
