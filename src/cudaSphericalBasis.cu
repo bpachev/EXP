@@ -509,11 +509,13 @@ __global__ void coefReductionKernel(
     out._v[blockIdx.x + offset_in_block * gridDim.x] = shared[offset_in_block];
 }
 
-__global__ void coefKernel
-(dArray<cuFP_t> coef, dArray<cuFP_t> tvar, dArray<cuFP_t> work,
+// modified version of old coefKernel that just computes the variances and whatnot
+__global__ void coefKernelOld
+(dArray<cuFP_t> tvar, dArray<cuFP_t> work,
  dArray<cuFP_t> used, dArray<cudaTextureObject_t> tex,
- dArray<cuFP_t> Mass, dArray<cuFP_t> Afac,
- dArray<int> Indx, int l, unsigned Lmax, unsigned int nmax,
+ dArray<cuFP_t> Mass, dArray<cuFP_t> Afac, dArray<cuFP_t> Phi,
+ dArray<cuFP_t> Plm,  dArray<int> Indx,  int stride, 
+ int l, int m, unsigned Lmax, unsigned int nmax, cuFP_t norm,
  PII lohi, bool compute)
 {
   const int tid   = blockDim.x * blockIdx.x + threadIdx.x;
@@ -522,8 +524,9 @@ __global__ void coefKernel
 
   const cuFP_t fac0 = -4.0*M_PI;
 
-  for (int i=tid; i<N; i += gridDim.x*blockDim.x) {
+  for (int str=0; str<stride; str++) {
 
+    int i     = tid*stride + str;
     int npart = i + lohi.first;
 
     if (npart < lohi.second) {
@@ -536,20 +539,19 @@ __global__ void coefKernel
 
       if (mass>0.0) {
 				// For accumulating mass of used particles
-	if (l==0) used._v[i] = mass;
+	if (l==0 and m==0) used._v[i] = mass;
 
 #ifdef BOUNDS_CHECK
 	if (i>=Phi._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
 #endif
-	//cuFP_t phi  = Phi._v[i];
-	//cuFP_t cosp = cos(phi*m);
-	//cuFP_t sinp = sin(phi*m);
+	cuFP_t phi  = Phi._v[i];
+	cuFP_t cosp = cos(phi*m);
+	cuFP_t sinp = sin(phi*m);
 	
 #ifdef BOUNDS_CHECK
-	//if (psiz*(i+1)>Plm._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+	if (psiz*(i+1)>Plm._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
 #endif	
-	//cuFP_t *plm = &Plm._v[psiz*i];
-	//cuFP_t legendre_coefficient = legendre_scalar(l, m, theta._v[i]);
+	cuFP_t *plm = &Plm._v[psiz*i];
 	
 	// Do the interpolation
 	//
@@ -576,8 +578,7 @@ __global__ void coefKernel
 #ifdef BOUNDS_CHECK
 	  if (k>=tex._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
 #endif
-//	  cuFP_t v = (
-          cuFP_t v_partial = (
+	  cuFP_t v = (
 #if cuREAL == 4
 		     a*tex1D<float>(tex._v[k], ind  ) +
 		     b*tex1D<float>(tex._v[k], ind+1)
@@ -585,19 +586,17 @@ __global__ void coefKernel
 		     a*int2_as_double(tex1D<int2>(tex._v[k], ind  )) +
 		     b*int2_as_double(tex1D<int2>(tex._v[k], ind+1))
 #endif
-//		      ) * p0 * legendre_coefficient * fac0 * norm;
-	  ) * p0 * fac0;
+		      ) * p0 * plm[Ilm(l, m)] * fac0 * norm;
 	  
-	  coef._v[nmax*i+n] = v_partial*mass;
-	  /*coef._v[(2*n+0)*N + i] = v * cosp * mass;
-	  coef._v[(2*n+1)*N + i] = v * sinp * mass;*/
+	  //coef._v[(2*n+0)*N + i] = v * cosp * mass;
+	  //coef._v[(2*n+1)*N + i] = v * sinp * mass;
 
 	  // Load work space
 	  //
-	  //if (compute and tvar._s>0) {
-	  //  if (sphAcov) tvar._v[n*N + i   ] = v * mass;
-	  //  else         work._v[i*nmax + n] = v;
-	  //}
+	  if (compute and tvar._s>0) {
+	    if (sphAcov) tvar._v[n*N + i   ] = v * mass;
+	    else         work._v[i*nmax + n] = v;
+	  }
 	  
 #ifdef BOUNDS_CHECK
 	  if ((2*n+0)*N+i>=coef._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
@@ -625,10 +624,10 @@ __global__ void coefKernel
 	}
       } else {
 	// No contribution from off-grid particles
-	for (int n=0; n<nmax; n++) {
-	  coef._v[(2*n+0)*N + i] = 0.0;
-	  coef._v[(2*n+1)*N + i] = 0.0;
-	}
+	//for (int n=0; n<nmax; n++) {
+	//  coef._v[(2*n+0)*N + i] = 0.0;
+	//  coef._v[(2*n+1)*N + i] = 0.0;
+	//}
 
 	if (compute and tvar._s>0) {
 	  if (sphAcov) {
@@ -648,6 +647,124 @@ __global__ void coefKernel
 	      c++;
 	    }
 	  }
+	}
+      }
+    }
+  }
+
+}
+
+__global__ void coefKernel
+(dArray<cuFP_t> coef, dArray<cudaTextureObject_t> tex,
+ dArray<cuFP_t> Mass, dArray<cuFP_t> Afac,
+ dArray<int> Indx, int l, unsigned Lmax, unsigned int nmax,
+ PII lohi, int num_tex_arrs)
+{
+  extern __shared__ cuFP_t shared[];
+  const int tid   = blockDim.x * blockIdx.x + threadIdx.x;
+  const int psiz  = (Lmax+1)*(Lmax+2)/2;
+  const int N     = lohi.second - lohi.first;
+
+  const cuFP_t fac0 = -4.0*M_PI;
+
+  // cache as much of the texture memory as possible in shared memory
+  for (int n=0; n<num_tex_arrs; n++) {
+    int k = (n) ? l*nmax + n : 0;
+    for (int ind=threadIdx.x; ind < sphNumr; ind+=blockDim.x) {
+     #if cuREAL == 4
+       shared[n*sphNumr+ind] = tex1D<float>(tex._v[k], ind);
+     #else
+       shared[n*sphNumr+ind] = int2_as_double(tex1D<int2>(tex._v[k], ind));
+     #endif
+    }
+  } 
+  if (num_tex_arrs) __syncthreads();
+
+  for (int i=tid; i<N; i += gridDim.x*blockDim.x) {
+
+    int npart = i + lohi.first;
+
+    if (npart < lohi.second) {
+
+      cuFP_t mass = Mass._v[i];
+
+#ifdef BOUNDS_CHECK
+      if (i>=Mass._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
+
+      if (mass>0.0) {
+
+#ifdef BOUNDS_CHECK
+	if (i>=Phi._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
+	//cuFP_t phi  = Phi._v[i];
+	//cuFP_t cosp = cos(phi*m);
+	//cuFP_t sinp = sin(phi*m);
+	
+#ifdef BOUNDS_CHECK
+	//if (psiz*(i+1)>Plm._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif	
+	//cuFP_t *plm = &Plm._v[psiz*i];
+	//cuFP_t legendre_coefficient = legendre_scalar(l, m, theta._v[i]);
+	
+	// Do the interpolation
+	//
+	cuFP_t a = Afac._v[i];
+	cuFP_t b = 1.0 - a;
+	int  ind = Indx._v[i];
+	
+#ifdef BOUNDS_CHECK
+	if (i>=Afac._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+	if (i>=Indx._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
+
+        cuFP_t p0;
+	if (num_tex_arrs > 0) {
+	  p0 = a*shared[ind] + b*shared[ind+1];
+	}
+	else {
+	   p0 =
+#if cuREAL == 4
+	    a*tex1D<float>(tex._v[0], ind  ) +
+	    b*tex1D<float>(tex._v[0], ind+1) ;
+#else
+	    a*int2_as_double(tex1D<int2>(tex._v[0], ind  )) +
+	    b*int2_as_double(tex1D<int2>(tex._v[0], ind+1)) ;
+#endif
+	}
+
+	for (int n=0; n<nmax; n++) {
+          cuFP_t v_partial;
+          if (n+1 < num_tex_arrs) {
+	    v_partial = a*shared[(n+1)*sphNumr + ind] + b*shared[(n+1)*sphNumr + ind+1]; 
+	  }
+	  else {
+	    int k = 1 + l*nmax + n;
+
+#ifdef BOUNDS_CHECK
+	    if (k>=tex._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
+//	  cuFP_t v = (
+            v_partial = (
+#if cuREAL == 4
+		     a*tex1D<float>(tex._v[k], ind  ) +
+		     b*tex1D<float>(tex._v[k], ind+1)
+#else
+		     a*int2_as_double(tex1D<int2>(tex._v[k], ind  )) +
+		     b*int2_as_double(tex1D<int2>(tex._v[k], ind+1))
+#endif
+//		      ) * p0 * legendre_coefficient * fac0 * norm;
+	    );
+	  }
+	  
+	  coef._v[nmax*i+n] = v_partial * p0 * fac0 * mass;
+	  /*coef._v[(2*n+0)*N + i] = v * cosp * mass;
+	  coef._v[(2*n+1)*N + i] = v * sinp * mass;*/
+
+#ifdef BOUNDS_CHECK
+	  if ((2*n+0)*N+i>=coef._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+	  if ((2*n+1)*N+i>=coef._s) printf("out of bounds: %s:%d\n", __FILE__, __LINE__);
+#endif
 	}
       }
     }
@@ -732,26 +849,28 @@ forceKernel(dArray<cudaParticle> P, dArray<int> I, dArray<cuFP_t> coef,
       
       // Do the interpolation for the prefactor potential
       //
+      cuFP_t pm1, p00, pp1, p0, p1;
 #if cuREAL == 4
-      cuFP_t pm1 = tex1D<float>(tex._v[0], ind-1);
-      cuFP_t p00 = tex1D<float>(tex._v[0], ind  );
-      cuFP_t pp1 = tex1D<float>(tex._v[0], ind+1);
-      cuFP_t p0  = p00;
-      cuFP_t p1  = pp1;
+      pm1 = tex1D<float>(tex._v[0], ind-1);
+      p00 = tex1D<float>(tex._v[0], ind  );
+      pp1 = tex1D<float>(tex._v[0], ind+1);
+      p0  = p00;
+      p1  = pp1;
       if (in0==0) {
-	p1 = p0;
-	p0 = tex1D<float>(tex._v[0], 0);
+        p1 = p0;
+        p0 = tex1D<float>(tex._v[0], 0);
       }
 #else
-      cuFP_t pm1 = int2_as_double(tex1D<int2>(tex._v[0], ind-1));
-      cuFP_t p00 = int2_as_double(tex1D<int2>(tex._v[0], ind  ));
-      cuFP_t pp1 = int2_as_double(tex1D<int2>(tex._v[0], ind+1));
-      cuFP_t p0  = p00;
-      cuFP_t p1  = pp1;
+      pm1 = int2_as_double(tex1D<int2>(tex._v[0], ind-1));
+      p00 = int2_as_double(tex1D<int2>(tex._v[0], ind  ));
+      pp1 = int2_as_double(tex1D<int2>(tex._v[0], ind+1));
+      p0  = p00;
+      p1  = pp1;
       if (in0==0) {
-	p1 = p0;
-	p0 = int2_as_double(tex1D<int2>(tex._v[0], 0));
+        p1 = p0;
+        p0 = int2_as_double(tex1D<int2>(tex._v[0], 0));
       }
+    }
 #endif
 
       // For force accumulation
@@ -990,7 +1109,7 @@ public:
 
 
 void SphericalBasis::cudaStorage::resize_coefs
-(int nmax, int Lmax, int N, int gridSize, int stride,
+(int nmax, int Lmax, int N, int gridSize, int gridSize1, int stride,
  int sampT, bool pcavar, bool pcaeof, bool subsamp)
 {
   // Create space for coefficient reduction to prevent continued
@@ -999,8 +1118,8 @@ void SphericalBasis::cudaStorage::resize_coefs
   if (dN_coef.capacity() < 2*nmax*N)
     dN_coef.reserve(2*nmax*N);
   
-  if (dc_coef.capacity() < (Lmax+1)*2*nmax*gridSize)
-    dc_coef.reserve((Lmax+1)*2*nmax*gridSize);
+  if (dc_coef.capacity() < (Lmax+1)*2*nmax*gridSize1)
+    dc_coef.reserve((Lmax+1)*2*nmax*gridSize1);
   
   //if (plm1_d.capacity() < (Lmax+1)*(Lmax+2)/2*N)
   //  plm1_d.reserve((Lmax+1)*(Lmax+2)/2*N);
@@ -1042,7 +1161,7 @@ void SphericalBasis::cudaStorage::resize_coefs
   // Set needed space for current step
   //
   dN_coef.resize(2*nmax*N);
-  dc_coef.resize(2*nmax*gridSize*(Lmax+1));
+  dc_coef.resize(2*nmax*gridSize1*(Lmax+1));
 
   // This will stay fixed for the entire run
   //
@@ -1212,7 +1331,11 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
   cudaOccupancyMaxPotentialBlockSize(
            &minCoefGridSize, &coefBlockSize, coefComputeReduceKernel, 0, BLOCK_SIZE/2);
   unsigned int gridSize1 = minCoefGridSize;
-
+  size_t maxSMem = deviceProp.sharedMemPerBlock;
+  cudaMappingConstants f = getCudaMappingConstants();
+  size_t num_tex_arrs = maxSMem / (f.numr * sizeof(cuFP_t));
+  if (num_tex_arrs > nmax+1) num_tex_arrs = nmax+1;
+  int coefSMem = num_tex_arrs * f.numr * sizeof(cuFP_t);
   // Loop over bunches
   //
   for (int n=0; n<Npacks; n++) {
@@ -1253,7 +1376,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
     
     // Resize storage as needed
     //
-    cuS.resize_coefs(nmax, Lmax, N, gridSize1, stride,
+    cuS.resize_coefs(nmax, Lmax, N, gridSize, gridSize1, stride,
 		     sampT, pcavar, pcaeof, subsamp);
       
     // Shared memory size for the reduction
@@ -1289,36 +1412,19 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 
       // Compute the portion of each particle's contributions that doesn't depend on l
       //
-      coefKernel<<<gridSize, BLOCK_SIZE, 0, cr->stream>>>
-        (toKernel(cuS.dN_coef), toKernel(cuS.dN_tvar), toKernel(cuS.dW_tvar),
-         toKernel(cuS.u_d), toKernel(t_d), toKernel(cuS.m_d),
-         toKernel(cuS.a_d), 
-         toKernel(cuS.i_d), l, Lmax, nmax, cur, compute);
+      coefKernel<<<gridSize, BLOCK_SIZE, coefSMem, cr->stream>>>
+        (toKernel(cuS.dN_coef), toKernel(t_d), toKernel(cuS.m_d),
+         toKernel(cuS.a_d), toKernel(cuS.i_d),
+	 l, Lmax, nmax, cur, num_tex_arrs);
       
-      //for (int m=0; m<=l; m++) {
-	//cuFP_t ft = factorial(l, m);
 	
-	// Begin the reduction per grid block [perhaps this should use
-	// a stride?]
-	//
-	//unsigned int gridSize1 = N/BLOCK_SIZE;
-	//if (N > gridSize1*BLOCK_SIZE) gridSize1++;
-
-	//std::cout << "block size " << coefBlockSize << " grid size " << gridSize1 << std::endl;
-	
-        size_t maxSMem = deviceProp.sharedMemPerBlock;
 	int max_coeffs_per_thread = maxSMem / (2*coefBlockSize * sizeof(cuFP_t));
 	if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
 	int threads_per_m = 1 + (nmax-1) / max_coeffs_per_thread;
-        //int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
         int threads_per_particle = (l+1) * threads_per_m;
-        //if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
-	//int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
         int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_m);
         int redSMemSize = coeffs_per_thread*coefBlockSize * sizeof(cuFP_t);
         if (threads_per_particle > coefBlockSize) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));
-        //std::cout << "coefs per thread " << coeffs_per_thread << " threads per particle " << threads_per_particle << " threads per m " <<
-	//	threads_per_m << " block size " << coefBlockSize << " grid size " << gridSize1 << " nmax " << nmax << std::endl;
         coefComputeReduceKernel
           <<<gridSize1, coefBlockSize, redSMemSize, cr->stream>>>
            (toKernel(cuS.dc_coef), toKernel(cuS.dN_coef), toKernel(cuS.p_d),
@@ -1346,9 +1452,16 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 			  beg, beg, thrust::plus<cuFP_t>());
 	
 	thrust::advance(beg, osize*(l+1));
-	int m;
+	
+      for (int m=0; m<=l; m++) {
 	if (compute) {
-	  
+          cuFP_t ft = factorial(l, m);
+	  // call old unoptimized coef kernel
+	  coefKernelOld<<<gridSize, BLOCK_SIZE, 0, cr->stream>>>
+	  (toKernel(cuS.dN_tvar), toKernel(cuS.dW_tvar),
+	   toKernel(cuS.u_d), toKernel(t_d), toKernel(cuS.m_d),
+	   toKernel(cuS.a_d), toKernel(cuS.p_d), toKernel(cuS.plm1_d),
+	   toKernel(cuS.i_d), stride, l, m, Lmax, nmax, ft, cur, compute);
 	  if (pcavar) {
 	    
 	    int sN = N/sampT;
@@ -1486,7 +1599,7 @@ void SphericalBasis::determine_coefficients_cuda(bool compute)
 	    
 	  } // END: pcaeof
 	} // END: compute
-      //} // END: m-loop
+      } // END: m-loop
     } // END: l-loop
 
     // Compute number and total mass of particles used in coefficient
@@ -1615,13 +1728,9 @@ void SphericalBasis::determine_acceleration_cuda()
       
     cuS.resize_acc(Lmax, Nthread);
 
-    // Shared memory size for the reduction
-    //
-    int sMemSize = BLOCK_SIZE * sizeof(cuFP_t);
-    
     // Do the work
     //
-    forceKernel<<<gridSize, BLOCK_SIZE, sMemSize, cr->stream>>>
+    forceKernel<<<gridSize, BLOCK_SIZE, 0, cr->stream>>>
       (toKernel(cr->cuda_particles), toKernel(cr->indx1),
        toKernel(dev_coefs), toKernel(t_d),
        toKernel(cuS.plm1_d), toKernel(cuS.plm2_d),
@@ -2254,7 +2363,7 @@ void SphericalBasis::multistep_update_cuda()
 
 	// Resize storage as needed
 	//
-	cuS.resize_coefs(nmax, Lmax, N, gridSize1, stride,
+	cuS.resize_coefs(nmax, Lmax, N, gridSize, gridSize1, stride,
 			 sampT, pcavar, pcaeof, subsamp);
 	
 	// Shared memory size for the reduction
@@ -2292,11 +2401,9 @@ void SphericalBasis::multistep_update_cuda()
 	  start = std::chrono::high_resolution_clock::now();
 #endif
 	  coefKernel<<<gridSize, BLOCK_SIZE, 0, cs->stream>>>
-	    (toKernel(cuS.dN_coef),
-	     toKernel(cuS.dN_tvar), toKernel(cuS.dW_tvar),
-	     toKernel(cuS.u_d), toKernel(t_d), toKernel(cuS.m_d),
-	     toKernel(cuS.a_d), 
-	     toKernel(cuS.i_d), l, Lmax, nmax, cur, false);
+	    (toKernel(cuS.dN_coef), toKernel(t_d), toKernel(cuS.m_d),
+	     toKernel(cuS.a_d), toKernel(cuS.i_d),
+	     l, Lmax, nmax, cur, 0);
 
 #ifdef VERBOSE_TIMING
 	  finish = std::chrono::high_resolution_clock::now();
@@ -2313,28 +2420,12 @@ void SphericalBasis::multistep_update_cuda()
 	    // [perhaps this should use a stride?]
 	    //
 
-	  /*unsigned int gridSize1 = N/BLOCK_SIZE;
-          if (N > gridSize1*BLOCK_SIZE) gridSize1++;
-          size_t maxSMem = deviceProp.sharedMemPerBlock;
-          int max_coeffs_per_thread = maxSMem / (2*BLOCK_SIZE * sizeof(cuFP_t));
-          if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
-          int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
-	  //int threads_per_particle = threads_per_m * (l+1);
-          if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
-          int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
-          int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_m);
-          int redSMemSize = coeffs_per_thread*sMemSize;
-	  if (threads_per_particle > BLOCK_SIZE) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));*/
-	//std::cout << "block size " << coefBlockSize << " grid size " << gridSize1 << std::endl;
 	
         size_t maxSMem = deviceProp.sharedMemPerBlock;
 	int max_coeffs_per_thread = maxSMem / (2*coefBlockSize * sizeof(cuFP_t));
 	if (max_coeffs_per_thread > MAX_COEFFS_PER_THREAD) max_coeffs_per_thread = MAX_COEFFS_PER_THREAD;
-        //int threads_per_m = get_threads_per_particle(nmax, max_coeffs_per_thread);
         int threads_per_m = 1 + (nmax-1) / max_coeffs_per_thread;
 	int threads_per_particle = (l+1) * threads_per_m;
-        //if (threads_per_m != 1) std::cout << "Threads per m not  1" << std::endl;
-	//int threads_per_particle = get_next_pow2((l+1)*threads_per_m);
         int coeffs_per_thread = 2 * (1 + (nmax-1) / threads_per_m);
         int redSMemSize = coeffs_per_thread*coefBlockSize * sizeof(cuFP_t);
         if (threads_per_particle > coefBlockSize) throw std::runtime_error("Too many threads per particle: " + std::to_string(threads_per_particle));
